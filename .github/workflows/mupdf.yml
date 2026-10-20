@@ -1,4 +1,4 @@
-name: MuPDF Release
+name: Build and Release MuPDF
 
 on:
   workflow_dispatch:
@@ -8,223 +8,172 @@ permissions:
 
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 180
+    name: Build (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Windows
-          - name: windows-x86
-            platform: windows
+          # Windows MSBuild targets
+          - os: windows
+            arch: x64
+            runner: windows-latest
+            msbuild_arch: x64
+          - os: windows
             arch: x86
-            runs_on: windows-latest
-            vs_arch: x86
-          - name: windows-x64
-            platform: windows
-            arch: x64
-            runs_on: windows-latest
-            vs_arch: amd64
-          - name: windows-arm64
-            platform: windows
+            runner: windows-latest
+            msbuild_arch: Win32
+          - os: windows
             arch: arm64
-            runs_on: windows-latest
-            vs_arch: amd64_arm64
+            runner: windows-latest
+            msbuild_arch: ARM64
 
-          # Linux
-          - name: linux-x64
-            platform: linux
+          # Linux GNU Make targets
+          - os: linux
             arch: x64
-            runs_on: ubuntu-latest
-          - name: linux-arm64
-            platform: linux
+            runner: ubuntu-24.04
+          - os: linux
             arch: arm64
-            runs_on: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
 
-          # macOS
-          - name: macos-x64
-            platform: macos
+          # macOS GNU Make targets
+          - os: macos
             arch: x64
-            runs_on: macos-13
-          - name: macos-arm64
-            platform: macos
+            runner: macos-13
+          - os: macos
             arch: arm64
-            runs_on: macos-14
-
-    defaults:
-      run:
-        shell: bash
+            runner: macos-14
 
     steps:
-      - name: Checkout official MuPDF source
-        shell: bash
-        run: |
-          set -euxo pipefail
-          git clone --depth 1 git://git.ghostscript.com/mupdf.git "$RUNNER_TEMP/mupdf"
-          cd "$RUNNER_TEMP/mupdf"
-          git submodule update --init --depth 1
-          git rev-parse --short HEAD
+      - name: Checkout MuPDF source
+        uses: actions/checkout@v4
+        with:
+          repository: 'ArtifexSoftware/mupdf'
+          ref: '1.28.5'
+          submodules: recursive
 
-      - name: Install Linux deps
-        if: matrix.platform == 'linux'
+      # -----------------------------------------------------------------
+      # Windows: 编译静态库 (libmupdf.lib) 与动态库 (mupdf.dll)
+      # -----------------------------------------------------------------
+      - name: Setup MSBuild
+        if: matrix.os == 'windows'
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Windows Libraries
+        if: matrix.os == 'windows'
         shell: bash
         run: |
-          set -euxo pipefail
+          msbuild.exe platform/win32/mupdf.sln \
+            -p:Configuration=Release \
+            -p:Platform=${{ matrix.msbuild_arch }} \
+            -t:libmupdf,libmupdf_dll -m
+
+          mkdir -p package/include package/lib package/bin
+          cp -r include/* package/include/
+
+          # 提取输出文件
+          find platform/win32 -type f \( -name "*.lib" -o -name "*.dll" \) | while read -r file; do
+            if [[ "$file" =~ \.dll$ ]]; then
+              cp "$file" package/bin/
+            elif [[ "$file" =~ \.lib$ ]]; then
+              cp "$file" package/lib/
+            fi
+          done
+
+      # -----------------------------------------------------------------
+      # Linux: 编译静态库 (.a) 与动态库 (.so)
+      # -----------------------------------------------------------------
+      - name: Install Linux Dependencies
+        if: matrix.os == 'linux'
+        run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            pkg-config \
-            zlib1g-dev \
-            libfreetype6-dev \
-            libjpeg-dev \
-            libpng-dev \
-            libopenjp2-7-dev
+          sudo apt-get install -y pkg-config
 
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Build Linux Libraries
+        if: matrix.os == 'linux'
+        run: |
+          # 禁用图形组件，仅编译库文件
+          make -j$(nproc) build=release HAVE_GLUT=no HAVE_X11=no libs shared
+
+          mkdir -p package/include package/lib
+          cp -r include/* package/include/
+          
+          # 拷贝静态库与共享库
+          find build/release -maxdepth 1 -type f \( -name "*.a" -o -name "*.so*" \) -exec cp -d {} package/lib/ \;
+
+      # -----------------------------------------------------------------
+      # macOS: 显式关闭 X11/GLUT，解决 glx.h 缺失，生成 .a 与 .dylib
+      # -----------------------------------------------------------------
+      - name: Build macOS Libraries
+        if: matrix.os == 'macos'
+        run: |
+          # 显式关闭 X11 / GLUT，指定架构仅编译核心库 (libs)
+          make -j$(sysctl -n hw.ncpu) \
+            build=release \
+            HAVE_GLUT=no \
+            HAVE_X11=no \
+            XCFLAGS="-arch ${{ matrix.arch }}" \
+            libs
+
+          mkdir -p package/include package/lib
+          cp -r include/* package/include/
+
+          # 拷贝所有静态库 (.a)
+          find build/release -maxdepth 1 -name "libmupdf*.a" -exec cp {} package/lib/ \;
+
+          # 打包生成动态库 (.dylib)
+          # 注意：MuPDF 1.28.x 第三方依赖通常已预编译进 libmupdf-third.a，故需一并 force_load
+          THIRD_LIB=""
+          if [ -f "build/release/libmupdf-third.a" ]; then
+            THIRD_LIB="-Wl,-force_load,build/release/libmupdf-third.a"
           fi
 
-      - name: Build MuPDF for Linux
-        if: matrix.platform == 'linux'
+          clang -dynamiclib \
+            -arch ${{ matrix.arch }} \
+            -install_name @rpath/libmupdf.dylib \
+            -Wl,-force_load,build/release/libmupdf.a \
+            $THIRD_LIB \
+            -o package/lib/libmupdf.dylib
+
+      # -----------------------------------------------------------------
+      # 打包归档
+      # -----------------------------------------------------------------
+      - name: Package Artifacts
         shell: bash
         run: |
-          set -euxo pipefail
-          cd "$RUNNER_TEMP/mupdf"
+          PKG_NAME="mupdf-1.28.5-${{ matrix.os }}-${{ matrix.arch }}"
+          mv package "$PKG_NAME"
 
-          export CFLAGS="-O2 -fPIC"
-          export LDFLAGS=""
-          export CPPFLAGS=""
-
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            export CC=aarch64-linux-gnu-gcc
-            export CXX=aarch64-linux-gnu-g++
-            export AR=aarch64-linux-gnu-ar
-            export RANLIB=aarch64-linux-gnu-ranlib
-            export STRIP=aarch64-linux-gnu-strip
-            export CFLAGS="-O2 -fPIC -march=armv8-a"
-          fi
-
-          make -j"$(nproc)" HAVE_X11=no
-          make -j"$(nproc)" shared HAVE_X11=no
-
-          echo "=== built linux files ==="
-          find . -maxdepth 3 \( -name "libmupdf*.a" -o -name "libmupdf*.so*" \) | sort
-
-      - name: Install macOS deps
-        if: matrix.platform == 'macos'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          xcode-select --install || true
-
-      - name: Build MuPDF for macOS
-        if: matrix.platform == 'macos'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$RUNNER_TEMP/mupdf"
-
-          ARCH="${{ matrix.arch }}"
-          if [ "$ARCH" = "x64" ]; then
-            ARCH_FLAG="x86_64"
-          elif [ "$ARCH" = "arm64" ]; then
-            ARCH_FLAG="arm64"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            7z a "${PKG_NAME}.zip" "${PKG_NAME}"
           else
-            echo "Unsupported macOS arch: $ARCH"
-            exit 1
+            zip -ry "${PKG_NAME}.zip" "${PKG_NAME}"
           fi
 
-          export MACOSX_DEPLOYMENT_TARGET=10.15
-          export CFLAGS="-O2 -fPIC -arch ${ARCH_FLAG} -DGL_SILENCE_DEPRECATION=1 -Wno-error=deprecated-declarations -Wno-deprecated-declarations"
-          export CXXFLAGS="-O2 -fPIC -arch ${ARCH_FLAG} -DGL_SILENCE_DEPRECATION=1 -Wno-error=deprecated-declarations -Wno-deprecated-declarations"
-          export LDFLAGS="-arch ${ARCH_FLAG}"
-          export CPPFLAGS="-I$PWD/include -DGL_SILENCE_DEPRECATION=1"
-
-          make -j"$(sysctl -n hw.ncpu)" HAVE_X11=no
-          make -j"$(sysctl -n hw.ncpu)" shared HAVE_X11=no
-
-          echo "=== built macos files ==="
-          find . -maxdepth 3 \( -name "libmupdf*.a" -o -name "libmupdf*.dylib" \) | sort
-
-      - name: Build MuPDF for Windows
-        if: matrix.platform == 'windows'
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=${{ matrix.vs_arch }}
-          cd /d "%RUNNER_TEMP%\\mupdf"
-
-          nmake /f Makefile.msvc CFG=release
-          nmake /f Makefile.msvc CFG=release SHARED=1
-
-          echo "=== built windows files ==="
-          dir /s /b "%RUNNER_TEMP%\\mupdf" | findstr /I "mupdf.lib mupdf.dll libmupdf"
-
-      - name: Package release artifact
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          SRC_DIR="$RUNNER_TEMP/mupdf"
-          PKG_NAME="mupdf-${{ matrix.platform }}-${{ matrix.arch }}"
-          PKG_DIR="$RUNNER_TEMP/$PKG_NAME"
-
-          mkdir -p "$PKG_DIR/include" "$PKG_DIR/static" "$PKG_DIR/shared"
-
-          # include headers
-          if [ -d "$SRC_DIR/include" ]; then
-            cp -R "$SRC_DIR/include/." "$PKG_DIR/include/"
-          fi
-
-          # static libs
-          find "$SRC_DIR" -type f \( -name "libmupdf*.a" -o -name "*.lib" \) -exec cp -f {} "$PKG_DIR/static/" \;
-
-          # shared libs
-          find "$SRC_DIR" -type f \( -name "libmupdf*.so*" -o -name "libmupdf*.dylib" -o -name "mupdf*.dll" \) -exec cp -f {} "$PKG_DIR/shared/" \;
-
-          echo "=== package content before archive ==="
-          find "$PKG_DIR" -maxdepth 2 -print | sort
-
-          if [ "${{ matrix.platform }}" = "windows" ]; then
-            # Windows 必须走 PowerShell + tar.exe
-            # 否则 bash tar 会把 D:\ 视为远程路径，导致 "Cannot connect to D:"
-            pwsh -NoLogo -NoProfile -Command '
-              $pkg = "mupdf-${{ matrix.platform }}-${{ matrix.arch }}"
-              $out = Join-Path $env:GITHUB_WORKSPACE ("mupdf-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz")
-              tar.exe -C "$env:RUNNER_TEMP" -czf $out $pkg
-            '
-          else
-            tar -czf "$GITHUB_WORKSPACE/mupdf-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz" -C "$RUNNER_TEMP" "$PKG_NAME"
-          fi
-
-      - name: Upload artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mupdf-${{ matrix.platform }}-${{ matrix.arch }}
-          path: |
-            ${{ github.workspace }}/mupdf-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
-          if-no-files-found: error
+          name: mupdf-1.28.5-${{ matrix.os }}-${{ matrix.arch }}
+          path: mupdf-1.28.5-${{ matrix.os }}-${{ matrix.arch }}.zip
 
+  # -----------------------------------------------------------------
+  # 发布 GitHub Release
+  # -----------------------------------------------------------------
   release:
-    name: Publish GitHub Release
+    name: Publish Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     steps:
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: release-artifacts
+          path: release_assets
+          merge-multiple: true
 
-      - name: List release files
-        shell: bash
-        run: |
-          set -euxo pipefail
-          find release-artifacts -type f -name "*.tar.gz" | sort
-
-      - name: Publish release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release-artifacts/**/*.tar.gz
+          tag_name: ${{ github.ref_name }}
+          files: release_assets/*.zip
           generate_release_notes: true
