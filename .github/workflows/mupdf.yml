@@ -61,7 +61,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          git clone --depth 1 https://git.ghostscript.com/mupdf.git "$RUNNER_TEMP/mupdf"
+          git clone --depth 1 git://git.ghostscript.com/mupdf.git "$RUNNER_TEMP/mupdf"
           cd "$RUNNER_TEMP/mupdf"
           git submodule update --init --depth 1
           git rev-parse --short HEAD
